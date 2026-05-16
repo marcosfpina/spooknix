@@ -3,21 +3,36 @@ Cliente assíncrono 100% local para o Worker TTS (ex: XTTS-v2, F5-TTS, Piper).
 Não possui dependências de nuvem ou pacotes de terceiros como OpenAI.
 """
 
+import hashlib
 import io
+import logging
 import os
+import time
 import wave
+from pathlib import Path
 
 import aiohttp
 import numpy as np
+from . import metrics as m
+
+
+log = logging.getLogger(__name__)
+
+DEFAULT_TIMEOUT_S = 30.0
+CACHE_DIR = Path(os.path.expanduser("~/.cache/spooknix/tts"))
 
 
 class LocalTTSClient:
     """Cliente para interagir diretamente com o container TTS local via REST."""
 
-    def __init__(self, base_url: str | None = None):
+    def __init__(
+        self,
+        base_url: str | None = None,
+        timeout_s: float | None = None,
+        enable_cache: bool = True,
+    ):
         """
         Inicializa o cliente local.
-        Por padrão, procura o serviço na porta 8001 da própria máquina.
         """
         resolved_base_url = (
             base_url
@@ -31,33 +46,62 @@ class LocalTTSClient:
         self.api_path = os.getenv("TTS_API_PATH", "/tts")
         self.default_voice = os.getenv("TTS_VOICE", "default_voice")
         self.default_language = os.getenv("TTS_LANGUAGE", "en")
+        self.timeout_s = float(
+            timeout_s if timeout_s is not None else os.getenv("TTS_TIMEOUT_S", DEFAULT_TIMEOUT_S)
+        )
+        self.enable_cache = enable_cache
+        if self.enable_cache:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        log.debug("TTSClient initialized at %s%s (cache=%s)", self.base_url, self.api_path, self.enable_cache)
+
+    def _get_cache_path(self, text: str, voice: str, language: str) -> Path:
+        """Gera um path de cache determinístico baseado no conteúdo."""
+        key = f"{text}|{voice}|{language}".encode("utf-8")
+        digest = hashlib.sha256(key).hexdigest()
+        return CACHE_DIR / f"{digest}.wav"
 
     async def synthesize(self, text: str, voice: str | None = None) -> bytes:
         """
-        Envia a string de texto para o container local de TTS.
-        O endpoint exato (/tts, /generate, /api/tts) depende da imagem docker usada.
+        Envia a string de texto para o container local de TTS com suporte a cache.
         """
-        # Payload adaptável para as imagens TTS open-source mais comuns (XTTS/Coqui/Piper)
+        v = voice or self.default_voice
+        l = self.default_language
+        
+        if self.enable_cache:
+            cache_path = self._get_cache_path(text, v, l)
+            if cache_path.exists():
+                log.debug("tts.cache_hit key=%s", cache_path.stem[:8])
+                return cache_path.read_bytes()
+
         payload = {
             "text": text,
-            "voice": voice or self.default_voice,
-            "language": self.default_language,
+            "voice": v,
+            "language": l,
         }
+        endpoint = f"{self.base_url}{self.api_path}"
+        log.debug("tts.request endpoint=%s voice=%s chars=%d", endpoint, payload["voice"], len(text))
+
+        t0 = time.perf_counter()
 
         try:
             async with aiohttp.ClientSession() as session:
-                # O endpoint comum em wrappers locais (ajuste conforme o seu container suba)
-                endpoint = f"{self.base_url}{self.api_path}"
-
-                async with session.post(endpoint, json=payload, timeout=30) as resp:
+                async with session.post(endpoint, json=payload, timeout=self.timeout_s) as resp:
                     if resp.status == 200:
-                        return await resp.read() # Espera os bytes do WAV (PCM)
-                    else:
-                        err = await resp.text()
-                        print(f"\n[TTS Local Error] Erro {resp.status} do container TTS: {err}")
-                        return b""
+                        data = await resp.read()
+                        
+                        m.tts_synthesize_latency_ms.observe((time.perf_counter() - t0) * 1000)
+                        log.debug("tts.response status=200 bytes=%d", len(data))
+                        
+                        if self.enable_cache and data:
+                            cache_path = self._get_cache_path(text, v, l)
+                            cache_path.write_bytes(data)
+                            
+                        return data
+                    err = await resp.text()
+                    log.warning("tts.bad_status status=%d body=%s", resp.status, err[:200])
+                    return b""
         except Exception as e:
-            print(f"\n[TTS Local Error] Container offline ou erro de conexão em {self.base_url}: {e}")
+            log.error("tts.error url=%s err=%s", endpoint, e)
             return b""
 
     def decode_wav(self, wav_bytes: bytes) -> tuple[np.ndarray, int]:
@@ -69,10 +113,9 @@ class LocalTTSClient:
             with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
                 samplerate = wf.getframerate()
                 frames = wf.readframes(wf.getnframes())
-                # Converte int16 para float32 (formato esperado pelo sounddevice / PipeWire)
                 audio_int16 = np.frombuffer(frames, dtype=np.int16)
                 audio_float32 = audio_int16.astype(np.float32) / 32768.0
                 return audio_float32, samplerate
         except Exception as e:
-            print(f"[TTS Local Error] Falha ao fazer parse do WAV: {e}")
+            log.error("Failed to parse WAV bytes: %s", e)
             return np.array([], dtype=np.float32), 24000

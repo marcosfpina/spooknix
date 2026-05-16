@@ -11,14 +11,22 @@ import numpy as np
 import time
 
 
-SUPPORTED_MODELS = ["tiny", "base", "small", "medium", "large-v2", "large-v3"]
+SUPPORTED_MODELS = ["tiny", "base", "small", "medium", "large-v2", "large-v3", "large-v3-turbo"]
+
+# VAD config compartilhada entre transcribe_file e transcribe_stream para garantir
+# comportamento idêntico em arquivo e streaming. threshold=0.4 é mais sensível que
+# o padrão do faster-whisper (0.5) — captura speech baixinho em microfones.
+_VAD_PARAMS: dict[str, float | int] = {
+    "min_silence_duration_ms": 500,
+    "threshold": 0.4,
+}
 
 
 def _compute_type(size: str, device: str) -> str:
     """Seleciona compute_type ideal para o modelo e dispositivo."""
     if device == "cpu":
         return "int8"
-    if size in ("large-v2", "large-v3"):
+    if size in ("large-v2", "large-v3", "large-v3-turbo"):
         return "int8_float16"  # ~3GB VRAM — cabe folgado em 6GB
     return "float16"           # tiny/base/small/medium
 
@@ -68,10 +76,7 @@ def transcribe_file(model, audio_path: str, language: str = "pt", on_progress=No
         best_of=5,          # 5 candidatos — escolhe o melhor (↑ precisão conversacional)
         temperature=0.0,    # determinístico — melhor para STT
         vad_filter=True,
-        vad_parameters=dict(
-            min_silence_duration_ms=500,
-            threshold=0.4,  # mais sensível que o padrão (0.5)
-        ),
+        vad_parameters=_VAD_PARAMS,
         word_timestamps=True,
     )
     
@@ -148,6 +153,7 @@ def transcribe_stream(
         beam_size=5,
         temperature=0.0,
         vad_filter=True,
+        vad_parameters=_VAD_PARAMS,
         word_timestamps=True,
         chunk_length=chunk_length_s,
         condition_on_previous_text=True,

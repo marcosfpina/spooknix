@@ -50,18 +50,28 @@ def record_until_silence(
     samplerate: int = SAMPLE_RATE,
     stop_check_fn: Callable[[bytes], bool] | None = None,
     stop_check_interval: float = 2.0,
+    vad: object | None = None,
+    device: int | str | None = None,
+    meter: object | None = None,
 ) -> str:
     """Grava do microfone até detectar silêncio.
 
     Args:
         silence_duration: Segundos de silêncio contínuo para parar a gravação.
-        silence_threshold: Nível RMS abaixo do qual o áudio é considerado silêncio.
+        silence_threshold: Nível RMS abaixo do qual o áudio é considerado silêncio
+            (ignorado se `vad` for fornecido).
         max_duration: Duração máxima absoluta em segundos.
         samplerate: Taxa de amostragem (padrão 16000 Hz para Whisper).
         stop_check_fn: Função opcional chamada a cada `stop_check_interval` segundos
             com os últimos _STOP_WINDOW_S segundos de áudio como bytes WAV int16.
             Retorna True para parar a gravação imediatamente (ex: keyword "stop").
         stop_check_interval: Intervalo em segundos entre chamadas de stop_check_fn.
+        vad: Instância opcional de `SileroVAD` (ou similar com `.is_speech(chunk)`).
+            Quando fornecido, substitui o threshold RMS pela decisão neural.
+        device: Índice (int) ou nome (str) do dispositivo de input do PortAudio.
+            None usa o default. Veja `spooknix doctor` para listar opções.
+        meter: Instância opcional de `AudioMeter` — recebe `.feed(chunk)` a cada
+            callback para alimentar um Rich.Live externo.
 
     Returns:
         Caminho do arquivo WAV temporário (int16, mono, 16kHz).
@@ -78,6 +88,7 @@ def record_until_silence(
     max_chunks = int(max_duration * samplerate / BLOCKSIZE)
     window_chunks = int(_STOP_WINDOW_S * samplerate / BLOCKSIZE)
     silent_count = 0
+    has_spoken = False
     stop_reason = ["unknown"]
     started_at = time.monotonic()
 
@@ -88,7 +99,7 @@ def record_until_silence(
     )
 
     def callback(indata: np.ndarray, frames: int, time_info, status) -> None:
-        nonlocal silent_count
+        nonlocal silent_count, has_spoken
         if status:
             overflow_count[0] += 1
             log.warning(
@@ -105,20 +116,34 @@ def record_until_silence(
             n = len(chunks)
 
         rms = float(np.sqrt(np.mean(chunk ** 2)))
-        is_speech = rms >= silence_threshold
+        if vad is not None:
+            try:
+                is_speech = bool(vad.is_speech(chunk))  # type: ignore[attr-defined]
+            except Exception as exc:
+                log.warning("vad.error fallback_to_rms %s", exc)
+                is_speech = rms >= silence_threshold
+        else:
+            is_speech = rms >= silence_threshold
+
+        if meter is not None:
+            try:
+                meter.feed(chunk)  # type: ignore[attr-defined]
+            except Exception as exc:
+                log.debug("meter.feed_failed %s", exc)
 
         if is_speech:
             silent_count = 0
+            has_spoken = True
         else:
             silent_count += 1
 
         if log.isEnabledFor(logging.DEBUG):
             log.debug(
-                "chunk #%d rms=%.4f speech=%s silent=%d/%d",
-                n, rms, is_speech, silent_count, silent_chunks_needed,
+                "chunk #%d rms=%.4f speech=%s silent=%d/%d spoken=%s",
+                n, rms, is_speech, silent_count, silent_chunks_needed, has_spoken,
             )
 
-        if n > silent_chunks_needed and silent_count >= silent_chunks_needed:
+        if has_spoken and silent_count >= silent_chunks_needed:
             stop_reason[0] = "silence"
             log.info(
                 "recording.stop reason=silence chunks=%d silent_run=%d",
@@ -166,6 +191,7 @@ def record_until_silence(
             dtype="float32",
             blocksize=BLOCKSIZE,
             callback=callback,
+            device=device,
         ):
             stop_event.wait(timeout=max_duration + 5)
     except sd.PortAudioError as exc:

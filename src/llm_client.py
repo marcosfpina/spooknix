@@ -8,11 +8,14 @@ integrar facilmente com OpenAI, NVIDIA NIM, Groq, Ollama, vLLM, etc.
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
+
+from . import metrics as m
 
 
 class LLMClient:
@@ -33,11 +36,30 @@ class LLMClient:
         self.uses_openai_default_endpoint = self.base_url is None
 
         if self.uses_openai_default_endpoint and not key:
-            raise ValueError(
-                "LLM não configurado. Para rodar 100% local, defina LLM_BASE_URL e "
-                "LLM_MODEL (ex: http://localhost:8080/v1 + qwen-3.5). "
-                "Use OPENAI_API_KEY apenas se quiser OpenAI de verdade."
-            )
+            # Tenta llama.cpp local antes de desistir
+            from . import llm_fallback
+            available = llm_fallback.probe()
+            picked = llm_fallback.pick_model(available)
+            if picked:
+                self.base_url = f"{llm_fallback.DEFAULT_LLAMACPP_URL.rstrip('/')}/v1"
+                self.uses_openai_default_endpoint = False
+                key = "llamacpp"
+                if model is None and not os.getenv("LLM_MODEL"):
+                    model = picked
+            else:
+                raise ValueError(
+                    "LLM não configurado. Para rodar 100% local, "
+                    "1. baixe um provedor local de sua escolha (ex: llama.cpp, "
+                    "LM Studio, Ollama, vLLM), "
+                    "2. suba o modelo desejado (ex: qwen-3.5, gpt-oss:120b, etc.), "
+                    "3. configure as variáveis de ambiente LLM_BASE_URL e LLM_MODEL "
+                    "(ex: http://localhost:8080/v1 + gpt-oss:120b, etc.). "
+                    "Se for usar algum dos modelos já disponíveis no container "
+                    "docker-compose.yml, basta subir o container e usar "
+                    "http://localhost:8080/v1 + gpt-oss:120b, etc.",
+                    "ou "
+                    "4. exporte OPENAI_API_KEY."
+                )
 
         # Algumas APIs locais não requerem chave, mas a lib exige uma string
         self.api_key = key if key else "sk-no-key-required"
@@ -60,6 +82,7 @@ class LLMClient:
         Usado para a interação em tempo real na entrevista.
         """
         target_model = model or self.default_model
+        t0 = time.perf_counter()
         try:
             stream = await self.client.chat.completions.create(
                 model=target_model,
@@ -70,6 +93,7 @@ class LLMClient:
                 content = chunk.choices[0].delta.content
                 if content is not None:
                     yield content
+                    m.llm_turn_latency_ms.observe((time.perf_counter() - t0) * 1000)
         except Exception as e:
             yield f"\n[Erro no LLM: {e}]"
 
@@ -83,6 +107,7 @@ class LLMClient:
         Útil para o relatório final do Avaliador.
         """
         target_model = model or self.default_model
+        t0 = time.perf_counter()
         try:
             response = await self.client.chat.completions.create(
                 model=target_model,

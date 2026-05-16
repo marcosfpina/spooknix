@@ -21,6 +21,7 @@ import asyncio
 import json
 import os
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -29,7 +30,7 @@ import torch
 from aiohttp import web
 import aiohttp
 
-from .transcriber import get_model, transcribe_file, transcribe_stream, _compute_type
+from .transcriber import SUPPORTED_MODELS, get_model, transcribe_file, transcribe_stream, _compute_type
 from .audio_pipeline import AudioPipeline, PipelineConfig
 from . import metrics as m
 
@@ -41,26 +42,33 @@ ENABLE_DIARIZATION = os.getenv("ENABLE_DIARIZATION", "false").lower() == "true"
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
 
-# ── Estado global do modelo (singleton, lazy) ──────────────────────────────
+# ── Estado global do modelo (singleton, lazy, thread-safe) ─────────────────
 _model = None
 _model_name: str = MODEL_SIZE
+_model_lock = threading.Lock()
+_inference_lock = threading.Lock()  # Garante exclusividade no acesso à GPU/Modelo por request
 _server_start: float = time.time()
 
 
 def get_loaded_model(size: str | None = None):
-    """Carrega o modelo na primeira chamada; recarrega se `size` diferir do atual."""
+    """Carrega o modelo na primeira chamada; recarrega se `size` diferir do atual.
+
+    Thread-safe — concorrência de duas requests com `model_size_override`
+    diferente não dispara dois `WhisperModel.__init__` simultâneos.
+    """
     global _model, _model_name
     target = size or MODEL_SIZE
-    if _model is None or target != _model_name:
-        _model = get_model(target, DEVICE, COMPUTE_TYPE)
-        _model_name = target
-    return _model
+    with _model_lock:
+        if _model is None or target != _model_name:
+            _model = get_model(target, DEVICE, COMPUTE_TYPE)
+            _model_name = target
+        return _model
 
 
 # ── Handlers ───────────────────────────────────────────────────────────────
 
 async def health(request: web.Request) -> web.Response:
-    """GET /health — status do servidor."""
+    """GET /health — status do servidor e telemetria de VRAM."""
     cuda = torch.cuda.is_available()
     data = {
         "status": "ok",
@@ -72,10 +80,15 @@ async def health(request: web.Request) -> web.Response:
         "cuda": cuda,
     }
     if cuda:
-        data["gpu"] = torch.cuda.get_device_name(0)
-        data["vram_gb"] = round(
-            torch.cuda.get_device_properties(0).total_memory / 1e9, 1
-        )
+        try:
+            props = torch.cuda.get_device_properties(0)
+            data["gpu"] = props.name
+            data["vram_total_gb"] = round(props.total_memory / 1e9, 2)
+            data["vram_allocated_gb"] = round(torch.cuda.memory_allocated(0) / 1e9, 2)
+            data["vram_reserved_gb"] = round(torch.cuda.memory_reserved(0) / 1e9, 2)
+            data["vram_free_gb"] = round((props.total_memory - torch.cuda.memory_reserved(0)) / 1e9, 2)
+        except Exception as e:
+            data["gpu_error"] = str(e)
     return web.json_response(data)
 
 
@@ -117,14 +130,33 @@ async def transcribe(request: web.Request) -> web.Response:
             {"error": "campo 'file' é obrigatório"}, status=400
         )
 
+    if model_size_override and model_size_override not in SUPPORTED_MODELS:
+        return web.json_response(
+            {"error": f"modelo inválido '{model_size_override}'. Opções: {SUPPORTED_MODELS}"},
+            status=400,
+        )
+
+
     suffix = Path(filename).suffix or ".wav"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(audio_bytes)
         tmp_path = tmp.name
 
+    final_audio_path = tmp_path
+    extracted_audio_path: Path | None = None
+
     try:
+        from .media import extract_audio, is_video_or_compressed
+        if is_video_or_compressed(tmp_path):
+            extracted_audio_path = extract_audio(tmp_path)
+            final_audio_path = str(extracted_audio_path)
+
         model = get_loaded_model(model_size_override)
-        result = transcribe_file(model, tmp_path, language=language)
+        
+        # Inferência com trava global para evitar concorrência destrutiva na GPU
+        with _inference_lock:
+            result = transcribe_file(model, final_audio_path, language=language)
+        
         result["model"] = _model_name
         result["diarized"] = False
 
@@ -136,8 +168,10 @@ async def transcribe(request: web.Request) -> web.Response:
                 )
             try:
                 from .diarizer import diarize as run_diarize, assign_speakers
-                diarization = run_diarize(tmp_path)
-                result["segments"] = assign_speakers(result["segments"], diarization)
+                diarization = run_diarize(final_audio_path)
+                result["segments"] = assign_speakers(
+                    result["segments"], diarization, split_at_boundaries=True
+                )
                 result["diarized"] = True
             except ImportError:
                 return web.json_response(
@@ -146,6 +180,8 @@ async def transcribe(request: web.Request) -> web.Response:
                 )
     finally:
         Path(tmp_path).unlink(missing_ok=True)
+        if extracted_audio_path and extracted_audio_path.exists():
+            extracted_audio_path.unlink(missing_ok=True)
 
     return web.json_response(result)
 
@@ -256,9 +292,12 @@ async def _do_flush(
 ) -> None:
     """Executa flush do buffer em executor e envia partials + final ao cliente."""
     t0 = time.perf_counter()
-    segments = await loop.run_in_executor(
-        None, lambda: session.flush(model, language)
-    )
+
+    def _safe_flush():
+        with _inference_lock:
+            return session.flush(model, language)
+
+    segments = await loop.run_in_executor(None, _safe_flush)
     latency = (time.perf_counter() - t0) * 1000
     m.latency_ms.observe(latency)
 

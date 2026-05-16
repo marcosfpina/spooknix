@@ -5,12 +5,18 @@ Expõe métricas no formato OpenMetrics/Prometheus via /metrics.
 Renderização manual — sem dependência de prometheus-client.
 
 Métricas:
-  spooknix_chunks_total{type}       Counter
-  spooknix_latency_ms               Histogram (buckets: 50,100,200,500,1000,2000,5000)
-  spooknix_confidence               Gauge (média de confiança do último segmento)
-  spooknix_sessions_total           Counter
-  spooknix_active_sessions          Gauge (sessões WebSocket abertas no momento)
-  spooknix_words_total              Counter
+  spooknix_chunks_total{type}        Counter
+  spooknix_latency_ms                Histogram (50,100,200,500,1000,2000,5000)
+  spooknix_confidence                Gauge (média de confiança do último segmento)
+  spooknix_sessions_total            Counter
+  spooknix_active_sessions           Gauge (sessões WebSocket abertas no momento)
+  spooknix_words_total               Counter
+  spooknix_interviews_total{persona,scenario,difficulty}   Counter
+  spooknix_interview_duration_seconds                       Histogram
+  spooknix_summaries_total{template}                        Counter
+  spooknix_summary_chunks_total                             Counter
+  spooknix_llm_turn_latency_ms                              Histogram
+  spooknix_tts_synthesize_latency_ms                        Histogram
 """
 
 from __future__ import annotations
@@ -19,7 +25,9 @@ import threading
 from collections import defaultdict
 
 _LATENCY_BUCKETS: tuple[float, ...] = (50, 100, 200, 500, 1000, 2000, 5000)
-
+_DURATION_BUCKETS_S: tuple[float, ...] = (30, 60, 120, 300, 600, 1200, 1800, 3600)
+_LLM_TURN_BUCKETS_MS: tuple[float, ...] = (100, 250, 500, 1000, 2000, 5000, 10_000, 30_000)
+_TTS_BUCKETS_MS: tuple[float, ...] = (50, 100, 200, 500, 1000, 2000, 5000)
 
 class _Counter:
     def __init__(self) -> None:
@@ -99,6 +107,14 @@ sessions_total = _Counter()
 active_sessions = _Gauge()
 words_total = _Counter()
 
+# ── Sprint 9: orchestrator + summarizer metrics ─────────────────────────────
+interviews_total = _Counter()
+interview_duration_seconds = _Histogram(_DURATION_BUCKETS_S)
+summaries_total = _Counter()
+summary_chunks_total = _Counter()
+llm_turn_latency_ms = _Histogram(_LLM_TURN_BUCKETS_MS)
+tts_synthesize_latency_ms = _Histogram(_TTS_BUCKETS_MS)
+
 
 # ── Prometheus text format renderer ─────────────────────────────────────────
 
@@ -161,6 +177,67 @@ def render_prometheus() -> str:
             lines.append(f"spooknix_words_total{_labels_str(labels)} {v}")
     else:
         lines.append("spooknix_words_total 0")
+
+          # interviews_total
+    lines.append("# HELP spooknix_interviews_total Interview sessions started")
+    lines.append("# TYPE spooknix_interviews_total counter")
+    snap = interviews_total.snapshot()
+    if snap:
+        for labels, v in snap.items():
+            lines.append(f"spooknix_interviews_total{_labels_str(labels)} {v}")
+    else:
+        lines.append("spooknix_interviews_total 0")
+
+    # interview_duration_seconds histogram
+    lines.append("# HELP spooknix_interview_duration_seconds Interview wall-clock duration")
+    lines.append("# TYPE spooknix_interview_duration_seconds histogram")
+    snap_h = interview_duration_seconds.snapshot()
+    for b, c in zip(snap_h["buckets"], snap_h["counts"]):
+        lines.append(f'spooknix_interview_duration_seconds_bucket{{le="{b}"}} {c}')
+    lines.append(f'spooknix_interview_duration_seconds_bucket{{le="+Inf"}} {snap_h["inf"]}')
+    lines.append(f"spooknix_interview_duration_seconds_sum {snap_h['sum']}")
+    lines.append(f"spooknix_interview_duration_seconds_count {snap_h['count']}")
+
+    # summaries_total
+    lines.append("# HELP spooknix_summaries_total Summarize invocations")
+    lines.append("# TYPE spooknix_summaries_total counter")
+    snap = summaries_total.snapshot()
+    if snap:
+        for labels, v in snap.items():
+            lines.append(f"spooknix_summaries_total{_labels_str(labels)} {v}")
+    else:
+        lines.append("spooknix_summaries_total 0")
+
+    # summary_chunks_total
+    lines.append("# HELP spooknix_summary_chunks_total Chunks emitted by the summarizer")
+    lines.append("# TYPE spooknix_summary_chunks_total counter")
+    snap = summary_chunks_total.snapshot()
+    if snap:
+        for labels, v in snap.items():
+            lines.append(f"spooknix_summary_chunks_total{_labels_str(labels)} {v}")
+    else:
+        lines.append("spooknix_summary_chunks_total 0")
+
+    # llm_turn_latency_ms histogram
+    lines.append("# HELP spooknix_llm_turn_latency_ms Latency of a single LLM turn (ms)")
+    lines.append("# TYPE spooknix_llm_turn_latency_ms histogram")
+    snap_h = llm_turn_latency_ms.snapshot()
+    for b, c in zip(snap_h["buckets"], snap_h["counts"]):
+        lines.append(f'spooknix_llm_turn_latency_ms_bucket{{le="{b}"}} {c}')
+    lines.append(f'spooknix_llm_turn_latency_ms_bucket{{le="+Inf"}} {snap_h["inf"]}')
+    lines.append(f"spooknix_llm_turn_latency_ms_sum {snap_h['sum']}")
+    lines.append(f"spooknix_llm_turn_latency_ms_count {snap_h['count']}")
+
+    # tts_synthesize_latency_ms histogram
+    lines.append("# HELP spooknix_tts_synthesize_latency_ms Latency of one TTS synthesize call (ms)")
+    lines.append("# TYPE spooknix_tts_synthesize_latency_ms histogram")
+    snap_h = tts_synthesize_latency_ms.snapshot()
+    for b, c in zip(snap_h["buckets"], snap_h["counts"]):
+        lines.append(f'spooknix_tts_synthesize_latency_ms_bucket{{le="{b}"}} {c}')
+    lines.append(f'spooknix_tts_synthesize_latency_ms_bucket{{le="+Inf"}} {snap_h["inf"]}')
+    lines.append(f"spooknix_tts_synthesize_latency_ms_sum {snap_h['sum']}")
+    lines.append(f"spooknix_tts_synthesize_latency_ms_count {snap_h['count']}")
+
 
     lines.append("")
     return "\n".join(lines)

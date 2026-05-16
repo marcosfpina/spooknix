@@ -36,8 +36,11 @@ def cli():
 
 
 @cli.command()
-def info():
+@click.option("-v", "--verbose", count=True,
+              help="Logs em tempo real (-v INFO, -vv DEBUG).")
+def info(verbose):
     """Mostra status do sistema: GPU, VRAM e modelos disponíveis."""
+    _apply_verbose(verbose)
     import torch
 
     table = Table(title="Spooknix — System Info", show_header=False, min_width=52)
@@ -65,7 +68,7 @@ def info():
 @click.option("--language", "-l", default="pt", show_default=True,
               help="Código do idioma (pt, en, es, …)")
 @click.option("--model", "-m",
-              type=click.Choice(["tiny", "base", "small", "medium", "large-v2", "large-v3"]),
+              type=click.Choice(["tiny", "base", "small", "medium", "large-v2", "large-v3", "large-v3-turbo"]),
               default="large-v3", show_default=True,
               help="Tamanho do modelo Whisper")
 @click.option("--output-dir", "-o", default="outputs", show_default=True,
@@ -75,8 +78,11 @@ def info():
               type=click.Choice(["txt", "srt", "json", "all"]),
               default="all", show_default=True,
               help="Formato(s) de saída")
-def file(audio_path, language, model, output_dir, fmt):
+@click.option("-v", "--verbose", count=True,
+              help="Logs em tempo real (-v INFO, -vv DEBUG).")
+def file(audio_path, language, model, output_dir, fmt, verbose):
     """Transcreve um arquivo de áudio ou vídeo."""
+    _apply_verbose(verbose)
     from .transcriber import get_model, transcribe_file, generate_srt
     import torch
 
@@ -153,6 +159,42 @@ def file(audio_path, language, model, output_dir, fmt):
     )
 
 
+
+@cli.command()
+@click.option("--mic/--no-mic", default=False,
+              help="Gravar 1s do microfone para baseline de RMS (precisa de áudio funcional).")
+@click.option("--brev/--no-brev", default=False,
+              help="Modo Brev: sondas STT + LLM:8080 + TTS:8001 (companion workers).")
+@click.option("-v", "--verbose", count=True,
+              help="Logs em tempo real (-v INFO, -vv DEBUG).")
+def doctor(mic, brev, verbose):
+    """Verifica ambiente: CUDA, STT server, áudio, ffmpeg, llama.cpp (ou workers Brev)."""
+    _apply_verbose(verbose)
+    from .doctor import run_checks, render
+    checks = run_checks(include_mic=mic, brev=brev)
+    render(checks, console=out_console)
+
+
+
+
+@cli.command()
+@click.option("--smoke-only", is_flag=True,
+              help="Pular `docker compose up`, só rodar o smoke check.")
+def brev(smoke_only):
+    """Provisiona stack Brev (STT+LLM+TTS) e roda smoke check end-to-end."""
+    import subprocess
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parent.parent
+    script = repo_root / "scripts" / ("brev-smoke.sh" if smoke_only else "brev-launch.sh")
+    if not script.exists():
+        console.print(f"[red]Script não encontrado: {script}[/red]")
+        raise SystemExit(1)
+    try:
+        subprocess.run(["bash", str(script)], check=True, cwd=str(repo_root))
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(exc.returncode)
+
 SERVER_URL = os.getenv("SPOOKNIX_URL", "http://localhost:8000")
 
 
@@ -173,11 +215,18 @@ SERVER_URL = os.getenv("SPOOKNIX_URL", "http://localhost:8000")
               help="Palavra-chave falada para parar a gravação (ex: 'stop', 'para')")
 @click.option("--diarize/--no-diarize", default=False,
               help="Ativar diarização de speakers via pyannote-audio (requer HF_TOKEN)")
+@click.option("--device", default=None, type=str,
+              help="Índice do dispositivo de áudio (veja `spooknix doctor`)")
+@click.option("--vad-neural/--no-vad-neural", "vad_neural", default=False,
+              help="Usar Silero VAD ao invés de threshold RMS (mais robusto)")
+@click.option("--meter/--no-meter", default=False,
+              help="Mostrar widget de Peak/RMS/LUFS em tempo real")
 @click.option("--out", default=None, type=click.Path(dir_okay=False, writable=True),
               help="Salvar a transcrição final em um arquivo de texto/markdown")
 @click.option("-v", "--verbose", count=True,
               help="Logs em tempo real. -v = INFO (estado, stop reason), -vv = DEBUG (RMS por chunk).")
-def record(language, silence, threshold, clip, max_duration, server, stop_word, diarize, out, verbose):
+def record(language, silence, threshold, clip, max_duration, server, stop_word, diarize,
+           device, vad_neural, meter, out, verbose):
     """Grava do microfone e transcreve via servidor HTTP."""
     import os
     import subprocess
@@ -187,6 +236,31 @@ def record(language, silence, threshold, clip, max_duration, server, stop_word, 
 
     _apply_verbose(verbose)
     base_url = server or SERVER_URL
+
+    # device pode vir como int ("0") ou string ("default"); preserva semântica do PortAudio
+    device_arg: int | str | None = None
+    if device is not None:
+        try:
+            device_arg = int(device)
+        except ValueError:
+            device_arg = device
+
+    vad_instance = None
+    if vad_neural:
+        try:
+            from .vad_silero import SileroVAD
+            vad_instance = SileroVAD()
+        except ImportError as exc:
+            console.print(f"[yellow]VAD neural indisponível: {exc}[/yellow]")
+            console.print("[dim]  Caindo no threshold RMS.[/dim]")
+
+    meter_instance = None
+    live_ctx = None
+    if meter:
+        from .audio_meter import AudioMeter
+        from rich.live import Live
+        meter_instance = AudioMeter(sample_rate=16_000)
+        live_ctx = Live(meter_instance.render(), console=console, refresh_per_second=10)
 
     # Verificar servidor antes de gravar
     try:
@@ -237,25 +311,53 @@ def record(language, silence, threshold, clip, max_duration, server, stop_word, 
 
     # Gravar
     tmp_path: str | None = None
+
+    def _do_record() -> str:
+        return record_until_silence(
+            silence_duration=silence,
+            silence_threshold=threshold,
+            max_duration=max_duration,
+            stop_check_fn=_make_stop_check(stop_word),
+            stop_check_interval=2.0,
+            vad=vad_instance,
+            device=device_arg,
+            meter=meter_instance,
+        )
+
     try:
-        with console.status(
-            f"[red bold]● Gravando… (Ctrl+C ou diga '{stop_word}' para parar)[/red bold]"
-        ):
-            try:
-                tmp_path = record_until_silence(
-                    silence_duration=silence,
-                    silence_threshold=threshold,
-                    max_duration=max_duration,
-                    stop_check_fn=_make_stop_check(stop_word),
-                    stop_check_interval=2.0,
-                )
-            except KeyboardInterrupt:
-                console.print("\n[yellow]Gravação interrompida.[/yellow]")
-                if tmp_path is None:
-                    return
-            except RecordingError as exc:
-                console.print(f"[red]Erro de gravação: {exc}[/red]")
+        try:
+            if live_ctx is not None and meter_instance is not None:
+                # Modo --meter: usa Live ao invés de console.status.
+                # Atualizamos o render manualmente via monitor de polling rápido
+                # antes de a captação iniciar (meter.feed é chamado pelo callback do recorder).
+                import threading
+
+                stop_render = threading.Event()
+
+                def _ticker():
+                    while not stop_render.wait(0.1):
+                        live_ctx.update(meter_instance.render())
+
+                with live_ctx:
+                    t = threading.Thread(target=_ticker, daemon=True)
+                    t.start()
+                    try:
+                        tmp_path = _do_record()
+                    finally:
+                        stop_render.set()
+                        t.join(timeout=1.0)
+            else:
+                with console.status(
+                    f"[red bold]● Gravando… (Ctrl+C ou diga '{stop_word}' para parar)[/red bold]"
+                ):
+                    tmp_path = _do_record()
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Gravação interrompida.[/yellow]")
+            if tmp_path is None:
                 return
+        except RecordingError as exc:
+            console.print(f"[red]Erro de gravação: {exc}[/red]")
+            return
 
         if tmp_path is None:
             console.print("[red]Nenhum áudio capturado.[/red]")
@@ -525,112 +627,415 @@ async def _stream_async(
               help="URL base do servidor HTTP STT (padrão: http://localhost:8000)")
 @click.option("--model", default=None,
               help="Modelo do LLM a ser utilizado (ex: gpt-4o, llama-3)")
-@click.option("--out", default="outputs/interviews/session.md", type=click.Path(dir_okay=False, writable=True),
-              help="Salvar o relatório final em Markdown")
+@click.option("--persona", "persona_name", default="sarah", show_default=True,
+              help="Nome da persona em personas/<name>.yaml")
+@click.option("--scenario", "scenario_name", default="system_design", show_default=True,
+              help="Cenário em scenarios/<name>.yaml")
+@click.option("--difficulty", default="standard", show_default=True,
+              type=click.Choice(["easy", "standard", "hard"]))
+@click.option("--list", "list_sessions", is_flag=True,
+              help="Listar sessões anteriores no SQLite e sair")
+@click.option("--show", "show_id", type=int, default=None,
+              help="Imprimir detalhes da sessão com este ID e sair")
+@click.option("--diff", "diff_ids", nargs=2, type=int, default=None,
+              help="Comparar duas sessões por ID")
+@click.option("--out", default=None, type=click.Path(dir_okay=False, writable=True),
+              help="Caminho do relatório (default: outputs/interviews/<ts>-<persona>/feedback.md)")
 @click.option("-v", "--verbose", count=True,
               help="Logs do orquestrador. -v = transições de estado, -vv = RMS por chunk.")
-def interview(language, silence, threshold, server, model, out, verbose):
+def interview(language, silence, threshold, server, model, persona_name, scenario_name,
+              difficulty, list_sessions, show_id, diff_ids, out, verbose):
     """Simulador interativo de entrevistas profissionais com feedback via LLM (Full-Duplex TTS)."""
     import asyncio
     _apply_verbose(verbose)
+
+    # Comandos read-only: --list, --show, --diff (não rodam orchestrator)
+    if list_sessions:
+        _interview_list()
+        return
+    if show_id is not None:
+        _interview_show(show_id)
+        return
+    if diff_ids:
+        _interview_diff(diff_ids[0], diff_ids[1])
+        return
+
     try:
-        asyncio.run(_interview_async(language, silence, threshold, server, model, out))
+        asyncio.run(_interview_async(
+            language, silence, threshold, server, model,
+            persona_name, scenario_name, difficulty, out,
+        ))
     except KeyboardInterrupt:
         pass
 
-async def _interview_async(language, silence, threshold, server_url, model, out_path):
+
+def _interview_list():
+    from rich.table import Table
+    from . import sessions_db
+
+    records = sessions_db.list_all()
+    if not records:
+        out_console.print("[dim]Nenhuma sessão registrada ainda.[/dim]")
+        return
+
+    table = Table(title="Sessões de entrevista", show_header=True, header_style="bold")
+    table.add_column("ID", justify="right", style="bold cyan")
+    table.add_column("Quando")
+    table.add_column("Persona")
+    table.add_column("Cenário")
+    table.add_column("Difficulty")
+    table.add_column("Duração (s)", justify="right")
+    for r in records:
+        table.add_row(
+            str(r.id), r.ts, r.persona, r.scenario, r.difficulty, f"{r.duration_s:.0f}",
+        )
+    out_console.print(table)
+
+
+def _interview_show(session_id: int):
+    from rich.json import JSON
+    from rich.panel import Panel as RPanel
+    from . import sessions_db
+
+    r = sessions_db.get(session_id)
+    if r is None:
+        out_console.print(f"[red]Sessão #{session_id} não encontrada.[/red]")
+        return
+    out_console.print(RPanel.fit(
+        f"[bold]Persona:[/] {r.persona}\n"
+        f"[bold]Cenário:[/] {r.scenario} ({r.difficulty})\n"
+        f"[bold]Quando:[/] {r.ts}\n"
+        f"[bold]Duração:[/] {r.duration_s:.0f}s\n"
+        f"[bold]Transcript:[/] {r.transcript_path or '—'}\n"
+        f"[bold]Audio:[/] {r.audio_path or '—'}",
+        title=f"Sessão #{r.id}",
+    ))
+    if r.rubric_json:
+        out_console.print(RPanel(JSON(r.rubric_json), title="Rubric"))
+
+
+def _interview_diff(id_a: int, id_b: int):
+    from rich.table import Table
+    from . import sessions_db
+    from .rubric import AXES
+
+    a = sessions_db.get(id_a)
+    b = sessions_db.get(id_b)
+    if not a or not b:
+        out_console.print(f"[red]Sessão #{id_a} ou #{id_b} não encontrada.[/red]")
+        return
+    da = sessions_db.rubric_dict(a)
+    db = sessions_db.rubric_dict(b)
+
+    table = Table(title=f"Diff: #{id_a} vs #{id_b}", show_header=True, header_style="bold")
+    table.add_column("Eixo", style="bold cyan")
+    table.add_column(f"#{id_a}", justify="right")
+    table.add_column(f"#{id_b}", justify="right")
+    table.add_column("Δ", justify="right")
+    for axis in AXES:
+        sa = (da.get(axis) or {}).get("score", 0)
+        sb = (db.get(axis) or {}).get("score", 0)
+        delta = sb - sa
+        delta_str = f"[green]+{delta}[/]" if delta > 0 else f"[red]{delta}[/]" if delta < 0 else "0"
+        table.add_row(axis, str(sa), str(sb), delta_str)
+    out_console.print(table)
+
+
+async def _interview_async(
+    language, silence, threshold, server_url, model,
+    persona_name, scenario_name, difficulty, out_path,
+):
+    import os
+    import time
+    from pathlib import Path
+
+    from rich.console import Console
     from rich.markdown import Markdown
     from rich.panel import Panel
-    from rich.console import Console
-    import os
-    from pathlib import Path
 
     from .llm_client import LLMClient, InterviewSession, load_template
     from .tts_client import LocalTTSClient
-    from .orchestrator import Orchestrator, Persona, Scenario, build_system_prompt
+    from .orchestrator import Orchestrator, build_system_prompt
+    from . import personas as personas_mod
+    from . import scenarios as scenarios_mod
+    from . import sessions_db
+    from .rubric import parse_rubric
+    from .types import SessionRecord, outputs_path_for
 
     console = Console()
-    console.print(Panel.fit("[bold green]Iniciando Orchestrator Full-Duplex...[/]\n[dim]Pressione Ctrl+C para encerrar e gerar o relatório.[/]"))
+    console.print(Panel.fit(
+        "[bold green]Iniciando Orchestrator Full-Duplex...[/]\n"
+        "[dim]Pressione Ctrl+C para encerrar e gerar o relatório.[/]"
+    ))
 
-    # Configura Endpoints e Dependências
     SERVER_HTTP_URL = "http://localhost:8000"
     base_url = (server_url or SERVER_HTTP_URL).rstrip("/")
     if base_url.startswith("ws://"):
         base_url = "http://" + base_url[5:]
-
     stt_endpoint = f"{base_url}/transcribe"
 
+    # --- Persona / Scenario via YAML ---
+    try:
+        persona = personas_mod.load_persona(persona_name)
+        scn = scenarios_mod.load_scenario(scenario_name, difficulty)
+    except (personas_mod.PersonaNotFound, scenarios_mod.ScenarioNotFound, ValueError) as exc:
+        console.print(f"[bold red]Configuração inválida:[/] {exc}")
+        return
+
+    # Voz da persona pode vir via env (compatibilidade com o setup atual)
+    voice_env = os.getenv("SPOOKNIX_PERSONA_VOICE")
+    if voice_env and any(sep in voice_env for sep in ("/", ".")):
+        if Path(voice_env).exists():
+            persona.voice_ref_audio = voice_env
+
+    # --- LLM/TTS ---
     try:
         llm = LLMClient(model=model)
-        tts = LocalTTSClient() # Worker 3 local, apontando nativamente para $TTS_BASE_URL (http://localhost:8001)
+        tts = LocalTTSClient()
     except Exception as e:
         console.print(f"[bold red]Erro ao inicializar Clients (LLM/TTS):[/] {e}")
         return
 
-    # Injetando Camadas 1 e 2 dinâmicas (Dados da Sessão)
-    # Por ora, chumbaremos a Sarah, mas poderá vir via argumento da CLI depois.
-    persona_voice = os.getenv("SPOOKNIX_PERSONA_VOICE")
-    if persona_voice and any(sep in persona_voice for sep in ("/", ".")):
-        if not Path(persona_voice).exists():
-            console.print(
-                f"[yellow]Voice ref não encontrada em {persona_voice}. "
-                "Usando a voz padrão do worker TTS.[/]"
-            )
-            persona_voice = None
+    # --- Diretório de saída por sessão ---
+    session_dir = outputs_path_for(persona.name)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    transcript_path = session_dir / "transcript.md"
+    rubric_path = session_dir / "rubric.json"
+    out_path_obj = Path(out_path) if out_path else session_dir / "feedback.md"
 
-    sarah = Persona(
-        name="Sarah",
-        system_prompt="You are a Senior Technical Recruiter. You ask precise behavioral and technical questions, challenging candidates gently but firmly. Do not be a sycophant.",
-        voice_ref_audio=persona_voice,
-        voice_ref_text="Hi, I am Sarah, your technical interviewer."
-    )
-
-    scenario = Scenario(
-        interview_type="System Design",
-        target_role="Senior Software Engineer",
-        difficulty="Standard",
-        duration_mins=15
-    )
-
-    # Constrói a sessão de Entrevista com base nas Camadas 1 e 2
-    prompt = build_system_prompt(sarah, scenario)
+    # --- System prompt enriquecido com addenda do cenário ---
+    base_prompt = build_system_prompt(persona, scn.scenario)
+    addenda = "\n".join(filter(None, [scn.base_prompt_addendum, scn.prompt_addendum]))
+    prompt = base_prompt + ("\n\nAdditional context:\n" + addenda if addenda else "")
     session = InterviewSession(prompt)
 
-    # Executa a Camada 3 (Full-Duplex Engine)
-    orchestrator = Orchestrator(llm=llm, tts=tts, stt_endpoint=stt_endpoint, language=language)
-
-    await orchestrator.run_session(
-        session=session,
-        persona=sarah,
-        silence_s=silence,
-        threshold=threshold,
-        model=model
+    orchestrator = Orchestrator(
+        llm=llm, tts=tts, stt_endpoint=stt_endpoint, language=language,
     )
 
-    # --- Relatório Final (Camada 5: Reflexão) ---
+    from . import metrics as m
+    m.interviews_total.inc({
+        "persona": persona_name,
+        "scenario": scenario_name,
+        "difficulty": difficulty,
+    })
+
+
+
+    started_at = time.monotonic()
+    await orchestrator.run_session(
+        session=session, persona=persona,
+        silence_s=silence, threshold=threshold, model=model,
+    )
+    duration_s = time.monotonic() - started_at
+    m.interview_duration_seconds.observe(duration_s)
+
     transcript = session.get_transcript_text()
+    transcript_path.write_text(transcript, encoding="utf-8")
+
     if len(transcript.split()) < 10:
         console.print("[dim]Conversa muito curta. Relatório não gerado.[/]")
+        _persist(persona.name, scenario_name, difficulty, duration_s,
+                 transcript_path, rubric_json=None)
         return
 
-    console.print("\n[dim]Gerando relatório de feedback da entrevista (Camada de Reflexão). Por favor, aguarde...[/]")
+    # --- Avaliação (Rubric) ---
+    console.print("\n[dim]Gerando rubric estruturada via LLM…[/]")
     try:
-        evaluator_prompt = load_template("evaluator.md")
+        evaluator_prompt = load_template("evaluator_rubric.md")
     except FileNotFoundError:
-        # Se template falhar fallback inline
-        evaluator_prompt = "You are an expert technical interview evaluator. Provide constructive feedback on the candidate's answers, grammar, and fluency based on the transcript."
+        try:
+            evaluator_prompt = load_template("evaluator.md")
+        except FileNotFoundError:
+            evaluator_prompt = (
+                "You are an expert technical interview evaluator. "
+                "Return strict JSON with the 5-axis rubric."
+            )
 
     evaluator_session = InterviewSession(evaluator_prompt)
     evaluator_session.add_user_message(transcript)
+    raw_report = await llm.generate(evaluator_session.get_messages(), model)
 
-    report = await llm.generate(evaluator_session.get_messages(), model)
+    rubric = parse_rubric(raw_report)
+    rubric_json = rubric.to_json()
+    rubric_path.write_text(rubric_json, encoding="utf-8")
+    out_path_obj.write_text(raw_report, encoding="utf-8")
 
-    out_path_obj = Path(out_path)
-    out_path_obj.parent.mkdir(parents=True, exist_ok=True)
-    out_path_obj.write_text(report, encoding="utf-8")
+    sid = _persist(persona.name, scenario_name, difficulty, duration_s,
+                   transcript_path, rubric_json=rubric_json,
+                   feedback_path=out_path_obj)
 
-    console.print(Panel(Markdown(report), title="Feedback da Entrevista", expand=False))
-    console.print(f"\n[bold green]Relatório salvo em:[/] {out_path}")
+    console.print(Panel(Markdown(raw_report), title=f"Feedback da Entrevista (sessão #{sid})", expand=False))
+    console.print(f"\n[bold green]Artefatos:[/]\n  {transcript_path}\n  {rubric_path}\n  {out_path_obj}")
+
+
+def _persist(persona_name, scenario_name, difficulty, duration_s,
+             transcript_path, rubric_json=None, feedback_path=None) -> int:
+    from . import sessions_db
+    from .types import SessionRecord
+
+    rec = SessionRecord.new(persona=persona_name, scenario=scenario_name, difficulty=difficulty)
+    rec.duration_s = float(duration_s)
+    rec.transcript_path = str(transcript_path)
+    rec.audio_path = None  # MVP: o orchestrator ainda não dumpa o WAV consolidado
+    rec.rubric_json = rubric_json
+    return sessions_db.insert(rec)
+
+@cli.command()
+@click.argument("input_path", type=click.Path(exists=True, dir_okay=False))
+@click.option("--template", "template_name", default="summary", show_default=True,
+              type=click.Choice(["summary", "lecture", "meeting", "notes", "study_guide"]))
+@click.option("--language", "-l", default="pt", show_default=True)
+@click.option("--model", "-m",
+              type=click.Choice(["tiny", "base", "small", "medium", "large-v2", "large-v3", "large-v3-turbo"]),
+              default="large-v3", show_default=True)
+@click.option("--format", "-f", "fmt",
+              type=click.Choice(["md", "json", "srt-summary"]),
+              default="md", show_default=True)
+@click.option("--diarize/--no-diarize", default=False,
+              help="Atribuir speakers via pyannote (requer HF_TOKEN)")
+@click.option("--max-tokens", default=3000, type=int, show_default=True,
+              help="Tokens por chunk no LLM")
+@click.option("--out", default=None, type=click.Path(dir_okay=False, writable=True),
+              help="Caminho de saída (default: outputs/summaries/<stem>.<fmt>)")
+@click.option("-v", "--verbose", count=True)
+def summarize(input_path, template_name, language, model, fmt, diarize, max_tokens, out, verbose):
+    """Sumariza vídeo/áudio/lecture com timestamps clicáveis."""
+    import asyncio
+    _apply_verbose(verbose)
+    try:
+        asyncio.run(_summarize_async(
+            input_path, template_name, language, model, fmt, diarize, max_tokens, out,
+        ))
+    except KeyboardInterrupt:
+        pass
+
+
+async def _summarize_async(input_path, template_name, language, model, fmt,
+                            diarize, max_tokens, out):
+    import json as _json
+    from pathlib import Path
+
+    from .transcriber import get_model, transcribe_file
+    from .media import extract_audio, is_video_or_compressed
+    from .summarizer import chunk_segments, stitch, render_template
+    from .timestamp_links import format_mmss
+    from .llm_client import LLMClient, InterviewSession
+
+    src = Path(input_path)
+    stem = src.stem
+    output_path = Path(out) if out else Path("outputs/summaries") / f"{stem}.{fmt if fmt != 'srt-summary' else 'srt'}"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 1. Transcrição (faster-whisper consome mp4/mkv via ffmpeg interno;
+    #    para diarização precisamos de WAV explícito).
+    audio_for_diar: Path | None = None
+    if diarize and is_video_or_compressed(src):
+        console.print("[dim]Extraindo áudio para diarização…[/]")
+        audio_for_diar = extract_audio(src)
+
+    console.print(f"[bold cyan]►[/] Carregando modelo Whisper [bold]{model}[/]…")
+    import torch
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    m = get_model(model, device)
+
+    console.print(f"[bold cyan]►[/] Transcrevendo…")
+    transcribe_target = str(audio_for_diar) if audio_for_diar else str(src)
+    result = transcribe_file(m, transcribe_target, language=language)
+
+    segments = result["segments"]
+    if diarize:
+        from .diarizer import diarize as run_diarize, assign_speakers
+        console.print("[bold cyan]►[/] Diarizando…")
+        diar = run_diarize(str(audio_for_diar or src))
+        segments = assign_speakers(segments, diar, split_at_boundaries=True)
+
+    # 2. Chunking + LLM
+    source_uri = str(src)
+    chunks = chunk_segments(segments, max_tokens=max_tokens, source_uri=source_uri)
+    console.print(f"[dim]Dividido em {len(chunks)} chunks ({sum(len(c.text.split()) for c in chunks)} palavras totais)[/]")
+
+    from . import metrics as m
+    m.summaries_total.inc({"template": template_name})
+    m.summary_chunks_total.inc(n=len(chunks))
+
+    try:
+        llm = LLMClient(model=model)
+    except Exception as exc:
+        console.print(f"[red]LLM indisponível: {exc}[/red]")
+        return
+
+    chunk_summaries: list[str] = []
+    for i, ch in enumerate(chunks, 1):
+        console.print(f"[dim]  ↳ Sumarizando chunk {i}/{len(chunks)} ({format_mmss(ch.start)}–{format_mmss(ch.end)})…[/]")
+        prompt = (
+            "You are summarizing one chunk of a longer media transcript. "
+            "Preserve the original [mm:ss] timestamps in your bullets. "
+            "Be terse and concrete; no preamble. Markdown only."
+        )
+        session = InterviewSession(prompt)
+        session.add_user_message(ch.text)
+        s = await llm.generate(session.get_messages(), model)
+        chunk_summaries.append(s)
+
+    stitched = stitch(chunk_summaries)
+
+    # 3. Renderização final
+    if fmt == "md":
+        template_path = Path(__file__).resolve().parent.parent / "templates" / f"{template_name}.md"
+        if template_path.exists():
+            rendered = render_template(
+                template_path,
+                title=stem,
+                source=source_uri,
+                duration=format_mmss(result.get("duration", 0.0)),
+                language=result.get("language"),
+                tldr=stitched.split("\n\n---")[0],
+                key_points=stitched,
+                quotes="",
+                followups="",
+                chapters=stitched,
+                concepts="",
+                examples="",
+                decisions="",
+                action_items="",
+                participants="",
+                highlights=stitched,
+                memorize="",
+                glossary="",
+                questions="",
+                exercises="",
+            )
+        else:
+            rendered = stitched
+        output_path.write_text(rendered, encoding="utf-8")
+    elif fmt == "json":
+        payload = {
+            "source": source_uri,
+            "duration": result.get("duration"),
+            "language": result.get("language"),
+            "chunks": [
+                {"start": c.start, "end": c.end, "summary": s}
+                for c, s in zip(chunks, chunk_summaries)
+            ],
+        }
+        output_path.write_text(_json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    elif fmt == "srt-summary":
+        from .transcriber import generate_srt
+        # Gera SRT clássico do transcript completo; o sumário fica num .md sibling.
+        srt_path = output_path
+        generate_srt(result["segments"], str(srt_path))
+        md_sibling = srt_path.with_suffix(".summary.md")
+        md_sibling.write_text(stitched, encoding="utf-8")
+
+    console.print(f"[bold green]✓ Salvo em {output_path}[/]")
+
+    if audio_for_diar and audio_for_diar.exists():
+        try:
+            audio_for_diar.unlink()
+        except OSError:
+            pass
+
 
 
 if __name__ == "__main__":

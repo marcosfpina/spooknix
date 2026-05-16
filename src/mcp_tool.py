@@ -22,6 +22,8 @@ Tools exposed:
   spooknix_health     — check server/model/GPU status
   spooknix_transcribe — transcribe audio file → text + segments
   spooknix_diarize    — transcribe + speaker diarization
+  spooknix_doctor     — environment self-check (CUDA, STT server, audio, ffmpeg, llama.cpp)
+  spooknix_summarize  — transcribe + LLM-summarize a media file with [mm:ss] anchors
 """
 
 from __future__ import annotations
@@ -29,6 +31,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -89,8 +93,8 @@ async def list_tools() -> list[types.Tool]:
                     },
                     "model_size": {
                         "type": "string",
-                        "description": "Whisper model size override (tiny/base/small/medium/large-v3).",
-                        "enum": ["tiny", "base", "small", "medium", "large-v2", "large-v3"],
+                        "description": "Whisper model size override (tiny/base/small/medium/large-v3/large-v3-turbo).",
+                        "enum": ["tiny", "base", "small", "medium", "large-v2", "large-v3", "large-v3-turbo"],
                     },
                 },
                 "required": ["file_path"],
@@ -119,6 +123,55 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["file_path"],
             },
         ),
+    
+    
+            types.Tool(
+            name="spooknix_doctor",
+            description=(
+                "Run the spooknix environment self-check. "
+                "Reports CUDA availability, STT server health, audio devices, "
+                "ffmpeg presence, and llama.cpp server status. "
+                "Useful when something isn't working — start here."
+            ),
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        types.Tool(
+            name="spooknix_summarize",
+            description=(
+                "Transcribe an audio/video file and generate a structured Markdown "
+                "summary with clickable [mm:ss](source#t=N) timestamps. "
+                "Requires the local llama.cpp/OpenAI-compatible LLM the server is wired to. "
+                "Returns the rendered Markdown summary."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Absolute path to the media file (mp4, mp3, m4a, wav, …).",
+                    },
+                    "language": {
+                        "type": "string",
+                        "description": "Language code. Default: 'pt'.",
+                        "default": "pt",
+                    },
+                    "template": {
+                        "type": "string",
+                        "description": "Summary template style.",
+                        "enum": ["summary", "lecture", "meeting", "notes", "study_guide"],
+                        "default": "summary",
+                    },
+                    "diarize": {
+                        "type": "boolean",
+                        "description": "Identify speakers in the transcript before summarizing.",
+                        "default": False,
+                    },
+                },
+                "required": ["file_path"],
+            },
+        ),
+    
+    
     ]
 
 
@@ -132,6 +185,10 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         return await _handle_transcribe(base_url, arguments, diarize=False)
     elif name == "spooknix_diarize":
         return await _handle_transcribe(base_url, arguments, diarize=True)
+    elif name == "spooknix_doctor":
+        return await _handle_doctor(base_url)
+    elif name == "spooknix_summarize":
+        return await _handle_summarize(base_url, arguments)
     else:
         raise ValueError(f"Unknown tool: {name}")
 
@@ -221,6 +278,69 @@ async def _handle_transcribe(
         )]
     except Exception as exc:
         return [types.TextContent(type="text", text=f"ERROR: {exc}")]
+
+async def _handle_doctor() -> list[types.TextContent]:
+    """Invoca o módulo `src.doctor` direto — sem subprocess. Render plain text."""
+    try:
+        import io
+        from rich.console import Console
+        from . import doctor as doctor_mod
+
+        checks = doctor_mod.run_checks(include_mic=False)
+        buf = io.StringIO()
+        console = Console(file=buf, force_terminal=False, no_color=True, width=120)
+        doctor_mod.render(checks, console=console)
+        return [types.TextContent(type="text", text=buf.getvalue())]
+    except Exception as exc:
+        return [types.TextContent(type="text", text=f"ERROR running doctor: {exc}")]
+
+
+async def _handle_summarize(arguments: dict) -> list[types.TextContent]:
+    """Reusa o `spooknix summarize` da CLI via subprocess para evitar duplicar pipeline."""
+    file_path = Path(arguments["file_path"])
+    if not file_path.exists():
+        return [types.TextContent(type="text", text=f"ERROR: File not found: {file_path}")]
+
+    language = arguments.get("language", "pt")
+    template = arguments.get("template", "summary")
+    diarize = bool(arguments.get("diarize", False))
+
+    # Saída num tempfile e leitura — não dependemos de cwd.
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as tmp:
+        out_path = tmp.name
+
+    cmd = [
+        sys.executable, "-m", "src.cli", "summarize",
+        str(file_path),
+        "--template", template,
+        "--language", language,
+        "--format", "md",
+        "--out", out_path,
+    ]
+    if diarize:
+        cmd.append("--diarize")
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            return [types.TextContent(
+                type="text",
+                text=f"ERROR (exit {proc.returncode}):\n{stderr.decode(errors='replace')[:2000]}",
+            )]
+        text = Path(out_path).read_text(encoding="utf-8")
+        return [types.TextContent(type="text", text=text)]
+    except FileNotFoundError as exc:
+        return [types.TextContent(type="text", text=f"ERROR launching subprocess: {exc}")]
+    finally:
+        Path(out_path).unlink(missing_ok=True)
+
+
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
