@@ -79,9 +79,14 @@ print_next_steps() {
 ──────────────────────────────────────────────────────────────────
  You're ready. Suggested next commands:
 
+   spooknix doctor --brev                  # re-check workers anytime
    spooknix interview --persona sarah --scenario behavioral --difficulty hard
+   spooknix interview --list               # review previous sessions
+   spooknix record --vad-neural --meter --clip
+   spooknix stream --window 3 --clip
    spooknix summarize lecture.mp4 --template lecture
-   spooknix doctor --brev                  # re-check anytime
+   spooknix file meeting.m4a --model large-v3-turbo --format srt
+   spooknix brev --smoke-only              # quick preflight
 
  If you change .env.brev images, re-run this script.
 ──────────────────────────────────────────────────────────────────
