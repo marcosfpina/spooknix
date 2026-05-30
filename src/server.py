@@ -168,7 +168,17 @@ async def transcribe(request: web.Request) -> web.Response:
                 )
             try:
                 from .diarizer import diarize as run_diarize, assign_speakers
-                diarization = run_diarize(final_audio_path)
+                from .media import extract_audio, is_video_or_compressed
+
+                # pyannote precisa de WAV; faster-whisper aguenta mp4 mas o pipeline
+                # do diarizer não. Extrai uma vez e reusa.
+                if is_video_or_compressed(tmp_path):
+                    diar_audio_path = extract_audio(tmp_path)
+                    diar_input = str(diar_audio_path)
+                else:
+                    diar_input = tmp_path
+
+                diarization = run_diarize(diar_input)
                 result["segments"] = assign_speakers(
                     result["segments"], diarization, split_at_boundaries=True
                 )
