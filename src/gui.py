@@ -1,5 +1,9 @@
 """Spooknix GUI — systray leve para STT/TTS sem abrir terminal.
 
+⚠️  Este é o modo systray legado.
+Para a GUI desktop completa (com abas, dashboard, métricas e todas as
+funcionalidades), use:  spooknix-desktop  ou  python -m src.gui.app
+
 Requer: PyQt6
 Variáveis de ambiente:
   SPOOKNIX_URL : URL base do servidor (padrão: http://localhost:8000)
@@ -22,7 +26,13 @@ from PyQt6.QtCore import (
     pyqtSlot,
 )
 from PyQt6.QtGui import QColor, QIcon, QPainter, QPixmap
-from PyQt6.QtNetwork import QHttpMultiPart, QHttpPart, QNetworkAccessManager, QNetworkReply, QNetworkRequest
+from PyQt6.QtNetwork import (
+    QHttpMultiPart,
+    QHttpPart,
+    QNetworkAccessManager,
+    QNetworkReply,
+    QNetworkRequest,
+)
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -59,6 +69,7 @@ def _svg_to_icon(svg_bytes: bytes, size: int = 64) -> QIcon:
     px.fill(Qt.GlobalColor.transparent)
     painter = QPainter(px)
     from PyQt6.QtSvg import QSvgRenderer
+
     renderer = QSvgRenderer(QByteArray(svg_bytes))
     renderer.render(painter)
     painter.end()
@@ -67,15 +78,17 @@ def _svg_to_icon(svg_bytes: bytes, size: int = 64) -> QIcon:
 
 # ── Thread de gravação ────────────────────────────────────────────────────────
 
+
 class RecordThread(QThread):
     """Grava do microfone em background; nunca toca em widgets Qt diretamente."""
 
-    recording_finished = pyqtSignal(str)   # emite caminho do WAV temporário
-    recording_failed = pyqtSignal(str)     # emite mensagem de erro
+    recording_finished = pyqtSignal(str)  # emite caminho do WAV temporário
+    recording_failed = pyqtSignal(str)  # emite mensagem de erro
 
     def run(self) -> None:
         try:
             from .recorder import record_until_silence
+
             wav_path = record_until_silence()
             self.recording_finished.emit(wav_path)
         except Exception as exc:  # noqa: BLE001
@@ -83,6 +96,7 @@ class RecordThread(QThread):
 
 
 # ── Janela principal ──────────────────────────────────────────────────────────
+
 
 class SpooknixWindow(QMainWindow):
     """Janela compacta 380×480, frameless, com fade-in/out."""
@@ -359,6 +373,7 @@ class SpooknixWindow(QMainWindow):
             return
 
         import json
+
         raw = bytes(reply.readAll())
         try:
             data = json.loads(raw)
@@ -461,6 +476,7 @@ class SpooknixWindow(QMainWindow):
 
 # ── Systray ───────────────────────────────────────────────────────────────────
 
+
 class SpooknixTray(QSystemTrayIcon):
     """Systray icon com health check periódico."""
 
@@ -550,6 +566,7 @@ class SpooknixTray(QSystemTrayIcon):
 
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
+
 
 def main() -> None:
     app = QApplication(sys.argv)

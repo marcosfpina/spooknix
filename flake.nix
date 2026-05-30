@@ -25,32 +25,13 @@
         };
       };
 
-      # ── GUI package (thin client — sem torch/ML) ──────────────────────────
-      guiPkg = pkgs.python313.withPackages (ps: [
-        ps.pyqt6
-        ps.pyqt6-sip
+      # Python env com GTK4 bindings (nix, não pip)
+      desktopPython = pkgs.python313.withPackages (ps: [
+        ps.pygobject3
         ps.requests
-        ps.numpy
-        ps.sounddevice
-        ps.scipy
-        ps.click
-        ps.openai
-        ps.pyyaml
       ]);
 
-      spooknixGui = pkgs.writeShellApplication {
-        name = "spooknix-gui";
-        runtimeInputs = [
-          guiPkg
-          pkgs.portaudio
-          pkgs.wl-clipboard
-        ];
-        text = ''
-          export PYTHONPATH="${self}''${PYTHONPATH:+:$PYTHONPATH}"
-          exec python -m src.gui "$@"
-        '';
-      };
-
+      # ── Wrappers ────────────────────────────────────────────────────────
       poetryWrappedCommand =
         name: command:
         pkgs.writeShellApplication {
@@ -60,6 +41,23 @@
             exec poetry run ${command} "$@"
           '';
         };
+
+      # Desktop: Poetry venv + Nix libs via PYTHONPATH sink
+      spooknixDesktopCmd = pkgs.writeShellApplication {
+        name = "spooknix-desktop";
+        runtimeInputs = [
+          desktopPython
+        ];
+        text = ''
+          VENV_PYTHON="$PWD/.venv/bin/python"
+          if [ ! -x "$VENV_PYTHON" ]; then
+            echo "⚠️  .venv não encontrado. Rode 'nix develop' primeiro." >&2
+            exit 1
+          fi
+          export PYTHONPATH="${desktopPython}/${desktopPython.sitePackages}:$PYTHONPATH"
+          exec "$VENV_PYTHON" -m src.gui.app "$@"
+        '';
+      };
 
       spooknixCmd = poetryWrappedCommand "spooknix" "python -m src.cli";
       spooknixGuiCmd = poetryWrappedCommand "spooknix-gui" "python -m src.gui";
@@ -74,17 +72,36 @@
 
     in
     {
-      # ── Dev shell ─────────────────────────────────────────────────────────
+      # ── Dev shell ───────────────────────────────────────────────────────
       devShells.${system}.default = pkgs.mkShell {
         name = "stt-pipeline";
 
+        nativeBuildInputs = with pkgs; [
+          wrapGAppsHook4
+          gobject-introspection
+        ];
+
         packages = with pkgs; [
-          # Python + gerenciador de pacotes
+          # Python
           python313
           python313Packages.click
+          python313Packages.pygobject3
+          python313Packages.requests
           poetry
+
+          # GTK4 system (typelibs via wrapGAppsHook4)
+          gtk4
+          libadwaita
+          glib
+          pango
+          cairo
+          gdk-pixbuf
+          graphene
+          harfbuzz
+
           spooknixCmd
           spooknixGuiCmd
+          spooknixDesktopCmd
           pytestCmd
           pytestCovCmd
 
@@ -94,17 +111,17 @@
 
           # Áudio
           ffmpeg
-          portaudio # backend C do sounddevice
-          wl-clipboard # wl-copy para clipboard Wayland
+          portaudio
+          wl-clipboard
 
-          # Signal processing (scipy system libs)
+          # Signal processing
           blas
           lapack
 
           # Utils
           just
 
-          # eBPF — debug de áudio e syscalls em tempo real
+          # eBPF
           bpftrace
           bpfilter
           bpftools
@@ -112,7 +129,6 @@
           # Secrets
           sops
           age
-
         ];
 
         shellHook = ''
@@ -121,7 +137,6 @@
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo ""
 
-          # Verificar NVIDIA
           if command -v nvidia-smi &> /dev/null; then
             echo "✅ GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader)"
             echo "✅ VRAM: $(nvidia-smi --query-gpu=memory.total --format=csv,noheader)"
@@ -130,10 +145,9 @@
           fi
           echo ""
 
-          # Instalar dependências se necessário
-          if [ ! -d ".venv" ]; then
+          if [ ! -d ".venv" ] || ! .venv/bin/python -c "import click" 2>/dev/null; then
             echo "📦 Instalando dependências com Poetry..."
-            poetry install --with gui --with dev
+            poetry install --with dev
           fi
 
           echo "🐍 Python: $(poetry run python --version)"
@@ -141,26 +155,16 @@
           echo ""
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "Core CLI:"
-          echo "  spooknix info"
-          echo "  spooknix doctor [--mic|--brev]"
-          echo "  spooknix record --vad-neural --meter --clip"
-          echo "  spooknix stream --window 3 --clip"
-          echo "  spooknix file <audio> --format srt"
-          echo "  spooknix summarize lecture.mp4 --template lecture"
+          echo "  spooknix info | doctor | record | stream | file"
+          echo "  spooknix summarize | interview | brev"
           echo ""
-          echo "Conversation / Brev:"
-          echo "  spooknix interview --persona sarah --scenario behavioral --difficulty hard"
-          echo "  spooknix interview --list | --show <id> | --diff <a> <b>"
-          echo "  spooknix brev [--smoke-only]"
-          echo ""
-          echo "GUI:"
-          echo "  spooknix-gui"
+          echo "Desktop (GTK4):"
+          echo "  spooknix-desktop"
           echo ""
           echo "  pytest          → testes sem GPU/mic"
           echo "  pytest-cov      → com cobertura"
           echo ""
 
-          # ── Secrets (SOPS + age) ───────────────────────────────────────────
           export SOPS_AGE_KEY_FILE="$PWD/secrets/age.key"
           if [ -f "$SOPS_AGE_KEY_FILE" ] && [ -f "$PWD/secrets/secrets.yaml" ]; then
             export HF_TOKEN
@@ -168,48 +172,40 @@
             if [ -n "$HF_TOKEN" ]; then
               echo "🔑 Secrets: HF_TOKEN ✓ (via SOPS)"
             else
-              echo "⚠️  Secrets: HF_TOKEN vazio (verifique secrets/age.key)"
+              echo "⚠️  Secrets: HF_TOKEN vazio"
             fi
-
             export OPENAI_API_KEY
             OPENAI_API_KEY=$(sops -d --extract '["openai_api_key"]' "$PWD/secrets/secrets.yaml" 2>/dev/null || echo "")
             if [ -n "$OPENAI_API_KEY" ]; then
               echo "🔑 Secrets: OPENAI_API_KEY ✓ (via SOPS)"
             elif [ -n "$LLM_BASE_URL" ]; then
-              echo "🧠 LLM local configurado via LLM_BASE_URL=$LLM_BASE_URL"
+              echo "🧠 LLM local: LLM_BASE_URL=$LLM_BASE_URL"
             else
-              echo "ℹ️  LLM: defina LLM_BASE_URL para backend local ou OPENAI_API_KEY para OpenAI"
+              echo "ℹ️  LLM: defina LLM_BASE_URL ou OPENAI_API_KEY"
             fi
           else
             echo "⚠️  Secrets: secrets/age.key não encontrado"
-            echo "   Gere com: age-keygen -o secrets/age.key"
           fi
           echo ""
-
         '';
 
-        # Variáveis de ambiente para CUDA, áudio e libs C++ (numpy/torch via pip)
         LD_LIBRARY_PATH = "${pkgs.stdenv.cc.cc.lib}/lib:${pkgs.cudaPackages.cudatoolkit}/lib:${pkgs.portaudio}/lib";
-
-        # Redirecionar cache do HuggingFace para home do usuário
         HF_HOME = "$HOME/.cache/huggingface";
         HUGGINGFACE_HUB_CACHE = "$HOME/.cache/huggingface/hub";
-
-        # Mantém o ambiente previsível para wrappers e para `nix develop --command`
         POETRY_VIRTUALENVS_IN_PROJECT = "true";
       };
 
-      # ── Packages ──────────────────────────────────────────────────────────
+      # ── Packages ────────────────────────────────────────────────────────
       packages.${system} = {
-        default = spooknixGui;
-        gui = spooknixGui;
+        default = spooknixDesktopCmd;
+        spooknix-desktop = spooknixDesktopCmd;
       };
 
-      # ── NixOS module (backend container) ─────────────────────────────────
+      # ── NixOS module ────────────────────────────────────────────────────
       nixosModules.default = import ./nix/modules/nixos/default.nix;
       nixosModules.spooknix = import ./nix/modules/nixos/default.nix;
 
-      # ── Home-Manager module (systray GUI) ─────────────────────────────────
+      # ── Home-Manager module ─────────────────────────────────────────────
       homeManagerModules.default = import ./nix/modules/home-manager/default.nix;
       homeManagerModules.spooknix = import ./nix/modules/home-manager/default.nix;
     };
