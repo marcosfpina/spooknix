@@ -16,9 +16,9 @@ from src.gui.pages.home_page import HomePage
 from src.gui.pages.placeholders import (
     create_history_page,
     create_interview_page,
-    create_record_page,
     create_summarize_page,
 )
+from src.gui.pages.record_page import RecordPage
 from src.gui.pages.transcribe_page import TranscribePage
 from src.gui.workers.health_worker import HealthWorker
 
@@ -57,7 +57,7 @@ class MainWindow(Gtk.ApplicationWindow):
         # Páginas
         self._home_page = HomePage(on_navigate=self._navigate_to)
         self._stack.add_titled(self._home_page, "home", "🏠 Home")
-        self._stack.add_titled(create_record_page(), "record", "🎙 Gravar")
+        self._stack.add_titled(RecordPage(), "record", "🎙 Gravar")
         self._stack.add_titled(TranscribePage(), "transcribe", "📂 Transcrever")
         self._stack.add_titled(create_interview_page(), "interview", "🎭 Entrevista")
         self._stack.add_titled(create_summarize_page(), "summarize", "📝 Summarizar")

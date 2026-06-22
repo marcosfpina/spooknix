@@ -29,6 +29,7 @@
       desktopPython = pkgs.python313.withPackages (ps: [
         ps.pygobject3
         ps.requests
+        ps.numpy
       ]);
 
       # ── Wrappers ────────────────────────────────────────────────────────
